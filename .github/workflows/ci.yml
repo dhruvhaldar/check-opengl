@@ -1,0 +1,55 @@
+# Tests check_opengl.py on Linux in two scenarios:
+#   headless-egl   -> no display at all; the pure-ctypes EGL backend must
+#                     create a context via Mesa's software rasterizer
+#                     (this is exactly the situation of a bare server)
+#   desktop-glfw   -> virtual X server (Xvfb) + pip glfw; the GLFW backend
+#                     must create a real desktop-style GL context
+# The script's exit code is the test result:
+#   0 = active (pass), 1 = installed but not active (fail), 2 = not found (fail)
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.scenario }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [headless-egl, desktop-glfw]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Mesa GL runtime and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libegl-mesa0 xvfb mesa-utils
+
+      - name: Install glfw bindings (desktop scenario only)
+        if: matrix.scenario == 'desktop-glfw'
+        run: python -m pip install glfw
+
+      - name: Run OpenGL check (headless, EGL path)
+        if: matrix.scenario == 'headless-egl'
+        run: python check_opengl.py
+
+      - name: Run OpenGL check (desktop, GLFW path under Xvfb)
+        if: matrix.scenario == 'desktop-glfw'
+        run: xvfb-run -a python check_opengl.py
+
+      # To extend to other OSes later, duplicate the job with
+      # runs-on: windows-latest (WGL backend, software GDI context) or
+      # macos-latest (add `run: python -m pip install glfw`).

@@ -24,7 +24,8 @@ uses whichever it finds first:
     pip install glfw      (GLFW bindings)
     pip install pygame    (SDL2-based)
     pip install PyOpenGL   (GLUT-based; needs a display on Linux)
-    (EGL is tried last, no extra packages needed)
+    With none of those, pure-ctypes fallbacks run last: WGL on Windows,
+    EGL on Linux (including headless). No packages needed.
 """
 
 from __future__ import annotations
@@ -194,6 +195,91 @@ def try_glut(gl_lib):
         return None, f"glut error: {exc}"
 
 
+def try_wgl(gl_lib):
+    """Windows-only: pure-ctypes WGL context via a hidden window. No dependencies."""
+    if not IS_WINDOWS:
+        return None, None
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        gdi32 = ctypes.windll.gdi32
+    except AttributeError:
+        return None, None
+
+    class PIXELFORMATDESCRIPTOR(ctypes.Structure):
+        _fields_ = [
+            ("nSize", ctypes.c_uint16), ("nVersion", ctypes.c_uint16),
+            ("dwFlags", ctypes.c_uint32), ("iPixelType", ctypes.c_ubyte),
+            ("cColorBits", ctypes.c_ubyte), ("cRedBits", ctypes.c_ubyte),
+            ("cRedShift", ctypes.c_ubyte), ("cGreenBits", ctypes.c_ubyte),
+            ("cGreenShift", ctypes.c_ubyte), ("cBlueBits", ctypes.c_ubyte),
+            ("cBlueShift", ctypes.c_ubyte), ("cAlphaBits", ctypes.c_ubyte),
+            ("cAlphaShift", ctypes.c_ubyte), ("cAccumBits", ctypes.c_ubyte),
+            ("cAccumRedBits", ctypes.c_ubyte), ("cAccumGreenBits", ctypes.c_ubyte),
+            ("cAccumBlueBits", ctypes.c_ubyte), ("cAccumAlphaBits", ctypes.c_ubyte),
+            ("cDepthBits", ctypes.c_ubyte), ("cStencilBits", ctypes.c_ubyte),
+            ("cAuxBuffers", ctypes.c_ubyte), ("iLayerType", ctypes.c_ubyte),
+            ("bReserved", ctypes.c_ubyte), ("dwLayerMask", ctypes.c_uint32),
+            ("dwVisibleMask", ctypes.c_uint32), ("dwDamageMask", ctypes.c_uint32),
+        ]
+
+    user32.CreateWindowExW.restype = ctypes.c_void_p
+    user32.GetDC.restype = ctypes.c_void_p
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+    gl_lib.wglCreateContext.restype = ctypes.c_void_p
+    gl_lib.wglCreateContext.argtypes = [ctypes.c_void_p]
+    gl_lib.wglMakeCurrent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gl_lib.wglDeleteContext.argtypes = [ctypes.c_void_p]
+
+    hwnd = hdc = hrc = None
+    try:
+        WS_POPUP = 0x80000000
+        hwnd = user32.CreateWindowExW(
+            0, "STATIC", "opengl-probe", WS_POPUP, 0, 0, 1, 1,
+            None, None, kernel32.GetModuleHandleW(None), None,
+        )
+        if not hwnd:
+            return None, "CreateWindowExW failed"
+        hdc = user32.GetDC(hwnd)
+        if not hdc:
+            return None, "GetDC failed"
+
+        pfd = PIXELFORMATDESCRIPTOR()
+        pfd.nSize = ctypes.sizeof(PIXELFORMATDESCRIPTOR)
+        pfd.nVersion = 1
+        pfd.dwFlags = 0x4 | 0x20 | 0x1  # PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER
+        pfd.iPixelType = 0  # PFD_TYPE_RGBA
+        pfd.cColorBits = 24
+        pfd.cDepthBits = 24
+
+        pf = gdi32.ChoosePixelFormat(hdc, ctypes.byref(pfd))
+        if not pf or not gdi32.SetPixelFormat(hdc, pf, ctypes.byref(pfd)):
+            return None, "SetPixelFormat failed (no GPU driver?)"
+
+        hrc = gl_lib.wglCreateContext(hdc)
+        if not hrc:
+            return None, "wglCreateContext failed (no GPU driver / ICD missing?)"
+        if not gl_lib.wglMakeCurrent(hdc, hrc):
+            return None, "wglMakeCurrent failed"
+
+        info = query_gl(gl_lib)
+        return info or None, "context created but glGetString returned nothing"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"wgl error: {exc}"
+    finally:
+        try:
+            if hrc:
+                gl_lib.wglMakeCurrent(None, None)
+                gl_lib.wglDeleteContext(hrc)
+            if hwnd:
+                if hdc:
+                    user32.ReleaseDC(hwnd, hdc)
+                user32.DestroyWindow(hwnd)
+        except Exception:
+            pass
+
+
 def try_egl(gl_lib):
     names = {
         "win": ["libEGL.dll"],
@@ -341,7 +427,8 @@ def run(as_json: bool) -> int:
 
     if gl_lib:
         for backend, fn in (("glfw", try_glfw), ("pygame", try_pygame),
-                            ("glut", try_glut), ("egl", try_egl)):
+                            ("glut", try_glut), ("wgl", try_wgl),
+                            ("egl", try_egl)):
             info, detail = fn(gl_lib)
             if info:
                 backend_statuses[backend] = "ok"

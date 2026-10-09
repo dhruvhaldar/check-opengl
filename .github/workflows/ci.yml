@@ -74,6 +74,63 @@ jobs:
           python -m pip install pyinstaller
           pyinstaller --onefile --name check-opengl check_opengl.py
 
+      - name: Code sign executable
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $exePath = "dist\check-opengl.exe"
+          if (-not (Test-Path $exePath)) {
+            throw "Executable not found at $exePath"
+          }
+
+          if ($env:WINDOWS_CERTIFICATE_BASE64 -and $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            Write-Host "Found certificate secrets. Decoding PFX..."
+            $pfxPath = [System.IO.Path]::GetTempFileName() + ".pfx"
+            try {
+              $pfxBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64)
+              [System.IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+              $securePwd = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+              $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $securePwd
+            } finally {
+              if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
+            }
+          } else {
+            Write-Host "No certificate secrets configured. Generating self-signed certificate for signing..."
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=CheckOpenGL" -CertStoreLocation "Cert:\CurrentUser\My" -HashAlgorithm SHA256
+          }
+
+          $timestampServers = @(
+            "http://timestamp.digicert.com",
+            "http://timestamp.sectigo.com"
+          )
+          $signed = $false
+          foreach ($ts in $timestampServers) {
+            try {
+              Write-Host "Signing executable using timestamp server: $ts"
+              $sig = Set-AuthenticodeSignature -FilePath $exePath -Certificate $cert -TimestampServer $ts -HashAlgorithm SHA256 -ErrorAction Stop
+              if ($sig.SignerCertificate -ne $null) {
+                $signed = $true
+                break
+              }
+            } catch {
+              Write-Warning "Timestamp server $ts failed: $_"
+            }
+          }
+
+          if (-not $signed) {
+            Write-Host "Signing without timestamp server fallback..."
+            $sig = Set-AuthenticodeSignature -FilePath $exePath -Certificate $cert -HashAlgorithm SHA256
+          }
+
+          $finalSig = Get-AuthenticodeSignature -FilePath $exePath
+          Write-Host "Signature Subject: $($finalSig.SignerCertificate.Subject)"
+          Write-Host "Signature Status: $($finalSig.Status)"
+          if ($finalSig.SignerCertificate -eq $null) {
+            throw "Code signing verification failed: executable has no valid signature."
+          }
+
       - name: Test standalone executable
         run: .\dist\check-opengl.exe
 

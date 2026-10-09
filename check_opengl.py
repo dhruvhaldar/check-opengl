@@ -61,11 +61,14 @@ GL_STRING_NAMES = (
 EGL_NONE = 0x3038
 EGL_PBUFFER_BIT = 0x0001
 EGL_OPENGL_BIT = 0x0008
+EGL_OPENGL_ES2_BIT = 0x0004
 EGL_ALPHA_SIZE, EGL_BLUE_SIZE, EGL_GREEN_SIZE, EGL_RED_SIZE = 0x3021, 0x3022, 0x3023, 0x3024
 EGL_DEPTH_SIZE = 0x3025
 EGL_SURFACE_TYPE = 0x0305
 EGL_RENDERABLE_TYPE = 0x3040
 EGL_OPENGL_API = 0x30A2
+EGL_OPENGL_ES_API = 0x30A0
+EGL_CONTEXT_CLIENT_VERSION = 0x3098
 EGL_WIDTH, EGL_HEIGHT = 0x3057, 0x3056
 
 
@@ -137,7 +140,17 @@ def try_glfw(gl_lib):
         if not glfw.init():
             return None, "glfw.init() failed (no display server?)"
         glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
+        if IS_MAC:
+            glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+            glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 2)
+            glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
+            glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
         window = glfw.create_window(64, 64, "opengl-probe", None, None)
+        if not window and IS_MAC:
+            # Fallback to legacy profile (OpenGL 2.1) on macOS
+            glfw.default_window_hints()
+            glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
+            window = glfw.create_window(64, 64, "opengl-probe", None, None)
         if not window:
             return None, "glfw.create_window() failed (driver/GPU issue?)"
         glfw.make_context_current(window)
@@ -317,7 +330,7 @@ def try_egl(gl_lib):
             return None, "eglInitialize failed"
         egl.eglBindAPI(EGL_OPENGL_API)
 
-        cfg_attribs = (I32 * 15)(
+        cfg_attribs_gl = (I32 * 15)(
             EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
             EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
@@ -325,17 +338,33 @@ def try_egl(gl_lib):
             EGL_NONE,
         )
         configs = (VP * 1)()
-        if not egl.eglChooseConfig(dpy, cfg_attribs, configs, 1, ctypes.byref(I32(0))) or not configs[0]:
-            return None, "no EGL config supporting desktop OpenGL"
+        is_gles = False
+        if not (egl.eglChooseConfig(dpy, cfg_attribs_gl, configs, 1, ctypes.byref(I32(0))) and configs[0]):
+            # Fall back to OpenGL ES / minimal renderable config
+            cfg_attribs_fallback = (I32 * 7)(
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT | EGL_OPENGL_ES2_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
+                EGL_NONE,
+            )
+            if not (egl.eglChooseConfig(dpy, cfg_attribs_fallback, configs, 1, ctypes.byref(I32(0))) and configs[0]):
+                # Fall back to ANY valid config
+                cfg_attribs_any = (I32 * 3)(EGL_NONE, 0, EGL_NONE)
+                if not (egl.eglChooseConfig(dpy, cfg_attribs_any, configs, 1, ctypes.byref(I32(0))) and configs[0]):
+                    return None, "no suitable EGL config found"
+            # Try binding GLES if desktop OpenGL failed
+            if not egl.eglBindAPI(EGL_OPENGL_API):
+                egl.eglBindAPI(EGL_OPENGL_ES_API)
+                is_gles = True
 
-        ctx = egl.eglCreateContext(dpy, configs[0], None, (I32 * 1)(EGL_NONE))
+        ctx_attribs = (I32 * 3)(EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE) if is_gles else (I32 * 1)(EGL_NONE)
+        ctx = egl.eglCreateContext(dpy, configs[0], None, ctx_attribs)
         if not ctx:
             return None, "eglCreateContext failed"
 
         surf = egl.eglCreatePbufferSurface(
             dpy, configs[0], (I32 * 5)(EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE)
         )
-        if not egl.eglMakeCurrent(dpy, surf, surf, ctx):
+        if not surf or not egl.eglMakeCurrent(dpy, surf, surf, ctx):
             # Some drivers support surfaceless contexts instead.
             if not egl.eglMakeCurrent(dpy, None, None, ctx):
                 return None, "eglMakeCurrent failed"

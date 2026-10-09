@@ -12,6 +12,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -36,7 +37,7 @@ jobs:
       - name: Install Mesa GL runtime and Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgl1 libegl1 libegl-mesa0 xvfb mesa-utils
+          sudo apt-get install -y libgl1 libegl1 libgl1-mesa-dri libegl-mesa0 xvfb mesa-utils
 
       - name: Install glfw bindings (desktop scenario only)
         if: matrix.scenario == 'desktop-glfw'
@@ -44,12 +45,78 @@ jobs:
 
       - name: Run OpenGL check (headless, EGL path)
         if: matrix.scenario == 'headless-egl'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          EGL_PLATFORM: "surfaceless"
         run: python check_opengl.py
 
       - name: Run OpenGL check (desktop, GLFW path under Xvfb)
         if: matrix.scenario == 'desktop-glfw'
         run: xvfb-run -a python check_opengl.py
 
-      # To extend to other OSes later, duplicate the job with
-      # runs-on: windows-latest (WGL backend, software GDI context) or
-      # macos-latest (add `run: python -m pip install glfw`).
+  windows:
+    name: Windows (WGL)
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run OpenGL check (pure-ctypes WGL)
+        run: python check_opengl.py
+
+      - name: Build standalone executable (PyInstaller)
+        run: |
+          python -m pip install pyinstaller
+          pyinstaller --onefile --name check-opengl check_opengl.py
+
+      - name: Test standalone executable
+        run: .\dist\check-opengl.exe
+
+      - name: Upload Windows executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-opengl-windows-amd64
+          path: dist/check-opengl.exe
+
+  macos:
+    name: macOS (GLFW)
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install GLFW bindings
+        run: python -m pip install glfw
+
+      - name: Run OpenGL check
+        run: python check_opengl.py
+
+  release:
+    name: Publish GitHub Release
+    needs: [linux, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows executable artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: check-opengl-windows-amd64
+          path: release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/check-opengl.exe
+          generate_release_notes: true

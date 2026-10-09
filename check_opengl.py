@@ -208,6 +208,51 @@ def try_glut(gl_lib):
         return None, f"glut error: {exc}"
 
 
+def try_cgl(gl_lib):
+    """macOS-only: pure-ctypes CGL context (Apple Core OpenGL). No window or display needed."""
+    if not IS_MAC:
+        return None, None
+    try:
+        VP, I32 = ctypes.c_void_p, ctypes.c_int32
+        gl_lib.CGLChoosePixelFormat.argtypes = [ctypes.POINTER(I32), ctypes.POINTER(VP), ctypes.POINTER(I32)]
+        gl_lib.CGLCreateContext.argtypes = [VP, VP, ctypes.POINTER(VP)]
+        gl_lib.CGLSetCurrentContext.argtypes = [VP]
+        gl_lib.CGLDestroyContext.argtypes = [VP]
+        gl_lib.CGLDestroyPixelFormat.argtypes = [VP]
+
+        # CGLPixelFormatAttribute constants
+        kCGLPFAAllRenderers = 1
+        kCGLPFAAccelerated = 73
+        kCGLPFAOpenGLProfile = 99
+        kCGLOGLPVersion_Legacy = 0x1000
+        kCGLOGLPVersion_3_2_Core = 0x3200
+
+        # Try Core 3.2 profile first, then legacy profile
+        for prof in (kCGLOGLPVersion_3_2_Core, kCGLOGLPVersion_Legacy):
+            attribs = (I32 * 5)(
+                kCGLPFAAllRenderers,
+                kCGLPFAOpenGLProfile, prof,
+                0, 0
+            )
+            pix = VP()
+            npix = I32(0)
+            err = gl_lib.CGLChoosePixelFormat(attribs, ctypes.byref(pix), ctypes.byref(npix))
+            if err == 0 and pix.value:
+                ctx = VP()
+                if gl_lib.CGLCreateContext(pix, None, ctypes.byref(ctx)) == 0 and ctx.value:
+                    gl_lib.CGLSetCurrentContext(ctx)
+                    info = query_gl(gl_lib)
+                    gl_lib.CGLSetCurrentContext(None)
+                    gl_lib.CGLDestroyContext(ctx)
+                    gl_lib.CGLDestroyPixelFormat(pix)
+                    if info:
+                        return info, None
+                gl_lib.CGLDestroyPixelFormat(pix)
+        return None, "CGL failed to create an OpenGL context"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"cgl error: {exc}"
+
+
 def try_wgl(gl_lib):
     """Windows-only: pure-ctypes WGL context via a hidden window. No dependencies."""
     if not IS_WINDOWS:
@@ -237,9 +282,19 @@ def try_wgl(gl_lib):
         ]
 
     user32.CreateWindowExW.restype = ctypes.c_void_p
+    user32.CreateWindowExW.argtypes = [
+        ctypes.c_uint32, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+    ]
     user32.GetDC.restype = ctypes.c_void_p
+    user32.GetDC.argtypes = [ctypes.c_void_p]
     user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+    gdi32.ChoosePixelFormat.restype = ctypes.c_int
+    gdi32.ChoosePixelFormat.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.SetPixelFormat.restype = ctypes.c_bool
+    gdi32.SetPixelFormat.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
     gl_lib.wglCreateContext.restype = ctypes.c_void_p
     gl_lib.wglCreateContext.argtypes = [ctypes.c_void_p]
     gl_lib.wglMakeCurrent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -293,6 +348,47 @@ def try_wgl(gl_lib):
             pass
 
 
+def try_osmesa(gl_lib):
+    """Off-screen Mesa context backend (Linux/headless fallback)."""
+    if not IS_LINUX:
+        return None, None
+    osmesa = None
+    for name in ("libOSMesa.so.8", "libOSMesa.so.6", "libOSMesa.so"):
+        try:
+            osmesa = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if osmesa is None:
+        return None, None
+    VP, I32 = ctypes.c_void_p, ctypes.c_int32
+    ctx = None
+    try:
+        osmesa.OSMesaCreateContext.restype = VP
+        osmesa.OSMesaCreateContext.argtypes = [ctypes.c_uint, VP]
+        osmesa.OSMesaMakeCurrent.restype = ctypes.c_bool
+        osmesa.OSMesaMakeCurrent.argtypes = [VP, VP, ctypes.c_uint, I32, I32]
+        osmesa.OSMesaDestroyContext.argtypes = [VP]
+
+        OSMESA_RGBA = 0x1908
+        ctx = osmesa.OSMesaCreateContext(OSMESA_RGBA, None)
+        if not ctx:
+            return None, "OSMesaCreateContext failed"
+        buf = (ctypes.c_ubyte * (16 * 16 * 4))()
+        if not osmesa.OSMesaMakeCurrent(ctx, buf, 0x1401, 16, 16):
+            return None, "OSMesaMakeCurrent failed"
+        info = query_gl(gl_lib) if gl_lib else {}
+        return info or None, "context created but glGetString returned nothing"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"osmesa error: {exc}"
+    finally:
+        try:
+            if ctx:
+                osmesa.OSMesaDestroyContext(ctx)
+        except Exception:
+            pass
+
+
 def try_egl(gl_lib):
     names = {
         "win": ["libEGL.dll"],
@@ -337,21 +433,19 @@ def try_egl(gl_lib):
             EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 24,
             EGL_NONE,
         )
+        num_configs = I32(0)
         configs = (VP * 1)()
         is_gles = False
-        if not (egl.eglChooseConfig(dpy, cfg_attribs_gl, configs, 1, ctypes.byref(I32(0))) and configs[0]):
-            # Fall back to OpenGL ES / minimal renderable config
-            cfg_attribs_fallback = (I32 * 7)(
-                EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT | EGL_OPENGL_ES2_BIT,
-                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
-                EGL_NONE,
-            )
-            if not (egl.eglChooseConfig(dpy, cfg_attribs_fallback, configs, 1, ctypes.byref(I32(0))) and configs[0]):
-                # Fall back to ANY valid config
-                cfg_attribs_any = (I32 * 3)(EGL_NONE, 0, EGL_NONE)
-                if not (egl.eglChooseConfig(dpy, cfg_attribs_any, configs, 1, ctypes.byref(I32(0))) and configs[0]):
-                    return None, "no suitable EGL config found"
-            # Try binding GLES if desktop OpenGL failed
+        if not (egl.eglChooseConfig(dpy, cfg_attribs_gl, configs, 1, ctypes.byref(num_configs)) and num_configs.value > 0 and configs[0]):
+            # Query all available configs from the EGL display
+            egl.eglGetConfigs.argtypes = [VP, ctypes.POINTER(VP), I32, ctypes.POINTER(I32)]
+            all_configs = (VP * 64)()
+            total_cfgs = I32(0)
+            if egl.eglGetConfigs(dpy, all_configs, 64, ctypes.byref(total_cfgs)) and total_cfgs.value > 0:
+                configs[0] = all_configs[0]
+            else:
+                return None, "no suitable EGL config found"
+            # Try desktop GL API, fallback to GLES if necessary
             if not egl.eglBindAPI(EGL_OPENGL_API):
                 egl.eglBindAPI(EGL_OPENGL_ES_API)
                 is_gles = True
@@ -455,9 +549,10 @@ def run(as_json: bool) -> int:
     gl_info = None
 
     if gl_lib:
-        for backend, fn in (("glfw", try_glfw), ("pygame", try_pygame),
-                            ("glut", try_glut), ("wgl", try_wgl),
-                            ("egl", try_egl)):
+        for backend, fn in (("cgl", try_cgl), ("wgl", try_wgl),
+                            ("glfw", try_glfw), ("pygame", try_pygame),
+                            ("glut", try_glut), ("egl", try_egl),
+                            ("osmesa", try_osmesa)):
             info, detail = fn(gl_lib)
             if info:
                 backend_statuses[backend] = "ok"

@@ -37,7 +37,7 @@ jobs:
       - name: Install Mesa GL runtime and Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgl1 libegl1 libgl1-mesa-dri libegl-mesa0 xvfb mesa-utils
+          sudo apt-get install -y libgl1 libegl1 libgl1-mesa-dri libegl-mesa0 libosmesa6 xvfb mesa-utils
 
       - name: Install glfw bindings (desktop scenario only)
         if: matrix.scenario == 'desktop-glfw'
@@ -84,7 +84,7 @@ jobs:
           path: dist/check-opengl.exe
 
   macos:
-    name: macOS (GLFW)
+    name: macOS (CGL)
     runs-on: macos-latest
     steps:
       - name: Check out repository
@@ -95,10 +95,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install GLFW bindings
-        run: python -m pip install glfw
-
-      - name: Run OpenGL check
+      - name: Run OpenGL check (pure-ctypes CGL)
         run: python check_opengl.py
 
   release:

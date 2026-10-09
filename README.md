@@ -53,14 +53,15 @@ The script tries context-creation backends in order and uses the first one that 
 
 | Order | Backend | Requires                 | Notes                                                   |
 | ----- | ------- | ------------------------ | ------------------------------------------------------- |
-| 1     | GLFW    | `pip install glfw`       | hidden window; best desktop option                      |
-| 2     | pygame  | `pip install pygame`     | SDL2-based                                              |
-| 3     | GLUT    | `pip install PyOpenGL`   | skipped on headless Linux (freeglut aborts the process) |
-| 4     | WGL     | nothing                  | Windows-only; pure-ctypes hidden window                 |
-| 5     | EGL     | nothing                  | headless servers, Wayland, ANGLE                        |
+| 1     | CGL     | nothing                  | macOS-only; pure-ctypes Apple Core OpenGL               |
+| 2     | WGL     | nothing                  | Windows-only; pure-ctypes hidden window                 |
+| 3     | GLFW    | `pip install glfw`       | hidden window; desktop option                           |
+| 4     | pygame  | `pip install pygame`     | SDL2-based                                              |
+| 5     | GLUT    | `pip install PyOpenGL`   | skipped on headless Linux (freeglut aborts the process) |
+| 6     | EGL     | nothing                  | headless servers, Wayland, ANGLE                        |
+| 7     | OSMesa  | nothing                  | Linux headless / software rasterizer fallback           |
 
-With **no optional packages installed**, the WGL backend (Windows) and the EGL
-backend (Linux, including headless) still verify a real context.
+With **zero external dependencies**, the native backends—**CGL** (macOS), **WGL** (Windows), and **EGL/OSMesa** (Linux)—verify context creation out of the box.
 ## Platform notes
 
 - **Windows**:
